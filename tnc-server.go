@@ -1,234 +1,203 @@
-// tnc-server
-// A serial/TCP bridge for connecting multiple read/write clients to an AX.25/KISS TNC device.
-// Written in the Go programming language
-// (c) 2014, Christopher Snell
-
+// tnc-server bridges a KISS TNC serial device to multiple TCP clients,
+// allowing several applications to share a single packet radio TNC.
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
-	"github.com/tarm/goserial"
-	"github.com/tv42/topic"
-	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
+
+	"go.bug.st/serial"
 )
 
-var (
-	listen *string
-	debug  *bool
+const (
+	minKISSFrameSize = 15   // smallest KISS packet we expect to see
+	kissDelimiter    = 0xc0 // KISS frame boundary marker
 )
 
-// The smallest KISS packet that we can ever expect to see.
-const reasonableSize = 15
+// broadcaster distributes frames from one producer to many consumers.
+type broadcaster struct {
+	mu        sync.RWMutex
+	consumers map[chan []byte]struct{}
+}
 
-// This function sets up our TCP listener and our serial port ReadWriteCloser
-// and handles incoming connections.
-func newSerialListener(serialport io.ReadWriteCloser) {
-
-	// We're going to use Topic to handle the one -> many distribution
-	// of our serial->net traffic
-	top := topic.New()
-	defer close(top.Broadcast)
-
-	// We use a channel as a FIFO buffer to handle the many -> one
-	// writes from our net->serial traffic
-	msg := make(chan []byte, 15)
-
-	l, err := net.Listen("tcp", *listen)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer l.Close()
-
-	log.Printf("Listening for connections on %v\n", *listen)
-
-	// Launch a broadcaster in a goroutine that reads off the serial port and sends to Topic
-	go serialReaderBroadcaster(top, serialport)
-
-	// Launch a writer in a goroutine to receive our incoming writes and write them to serial
-	go serialWriter(serialport, msg)
-
-	for {
-		// Wait for a connection.
-		conn, err := l.Accept()
-		log.Printf("Answered incoming client connection from %v\n", conn.RemoteAddr())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Set up a consumer channel for this new connection.  All reads off the
-		// serial port will be sent over this channel
-		consumer := make(chan interface{}, 1)
-		top.Register(consumer)
-
-		// Start a consumer goroutine to take the serial data off the consumer
-		// channel and send it to this network connection
-		go serialReaderConsumer(consumer, conn, top)
-
-		// Start a writer in a goroutine to read off the network and send all messages
-		// to the message buffer
-		go serialWriterConnection(conn, msg)
+func newBroadcaster() *broadcaster {
+	return &broadcaster{
+		consumers: make(map[chan []byte]struct{}),
 	}
 }
 
-// This function reads off the serial port and sends what it gets to Topic
-func serialReaderBroadcaster(top *topic.Topic, serialport io.ReadWriteCloser) {
-	var err error
-
-	// Wrap the goserial's ReadWriteCloser with a bufio.Reader so we can do fancy stuffs.
-	sr := bufio.NewReader(serialport)
-
-	for {
-
-		frame := []byte{}
-
-		for len(frame) <= reasonableSize {
-			// Read forward until we encounter 0xc0 and return this data including the 0xc0.
-			frame, err = sr.ReadBytes(byte(0xc0))
-			if err != nil {
-				log.Printf("Error reading bytes from serial: %v\n", err)
-			}
-		}
-
-		// Send our received frame to Topic for distribution to the consumer(s)
-		top.Broadcast <- frame
-
-	}
-
+func (b *broadcaster) subscribe() chan []byte {
+	ch := make(chan []byte, 16)
+	b.mu.Lock()
+	b.consumers[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
 }
 
-// This function reads from the Topic consumer and writes what it gets to the network
-func serialReaderConsumer(consumer chan interface{}, conn net.Conn, top *topic.Topic) {
-	defer conn.Close()
-	defer top.Unregister(consumer)
+func (b *broadcaster) unsubscribe(ch chan []byte) {
+	b.mu.Lock()
+	delete(b.consumers, ch)
+	b.mu.Unlock()
+	close(ch)
+}
 
-	for {
+func (b *broadcaster) send(data []byte) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for ch := range b.consumers {
 		select {
-		// A new message was received from this Topic consumer
-		case msg, ok := <-consumer:
-			if ok {
-				i, err := conn.Write(msg.([]byte))
-				if err != nil {
-					log.Printf("Error writing %v bytes to %v: %v\n", i, conn.RemoteAddr(), err)
-					log.Println("Client hung up.  Closing connection.")
-					conn.Close()
-					return
-				}
-			} else {
-				log.Printf("Channel closed (%v)", conn.RemoteAddr())
-				break
-			}
-		}
-	}
-}
-
-// This function reads off the network and sends everything it gets to the msg channel
-// for consumption by serialWriter()
-func serialWriterConnection(conn net.Conn, msg chan []byte) {
-	var err error
-
-	for {
-
-		frame := []byte{}
-		var first_byte byte
-
-		var frame_buffer bytes.Buffer
-
-		// Wrap a bufio.Reader around our net.Conn
-		r := bufio.NewReader(conn)
-
-		// Read our first byte, a 0xc0 and add it to the frame
-		first_byte, err = r.ReadByte()
-		if err != nil {
-			log.Printf("Error reading bytes from %v: %v", conn.RemoteAddr(), err)
-			log.Println("Client hung up.  Closing connection.")
-			conn.Close()
-			return
-		}
-
-		frame_buffer.WriteByte(first_byte)
-
-		for len(frame) <= reasonableSize {
-
-			// Read until we see a 0xc0, and store this in the frame (including that 0xc0 byte)
-			frame, err = r.ReadBytes(byte(0xc0))
-
-			if *debug {
-				fmt.Println("Byte#\tHexVal\tChar\tChar>>1\tBinary")
-				fmt.Println("-----\t------\t----\t-------\t------")
-				for k, v := range frame {
-					rs := v >> 1
-					fmt.Printf("%4d \t%#x \t%v \t%v\t%08b\n", k, v, string(v), string(rs), v)
-				}
-			}
-
-			if err != nil {
-				log.Printf("Error reading bytes from %v: %v", conn.RemoteAddr(), err)
-				log.Println("Client hung up.  Closing connection.")
-				conn.Close()
-				return
-			}
-		}
-
-		frame_buffer.Write(frame)
-
-		frame_out := frame_buffer.Bytes()
-
-		// Send the frame we just read off the network to the message buffer for eventual
-		// write to serial
-		msg <- frame_out
-
-	}
-
-}
-
-// This function reads frames off the buffered msg channel and writes them to serial
-func serialWriter(s io.ReadWriteCloser, msg chan []byte) {
-	for {
-		select {
-		case msg, ok := <-msg:
-			if ok {
-				_, err := s.Write(msg)
-				if err != nil {
-					log.Printf("Unable to write to serial port: %v\n", err)
-				}
-			} else {
-				log.Println("serialWriter message channel closed.")
-				break
-			}
+		case ch <- data:
+		default:
+			// drop frame if consumer can't keep up
 		}
 	}
 }
 
 func main() {
-
-	port := flag.String("port", "/dev/ttyUSB0", "Serial port device (default: /dev/ttyUSB0)")
-	baud := flag.Int("baud", 4800, "Baud rate for serial device (default: 4800")
-	listen = flag.String("listen", ":6700", "Address/port to listen on (defaults to 0.0.0.0:6700)")
-	debug = flag.Bool("debug", false, "Enable debugging information (default: false)")
+	portName := flag.String("port", "/dev/ttyUSB0", "serial port device")
+	baud := flag.Int("baud", 4800, "baud rate for serial device")
+	listenAddr := flag.String("listen", ":6700", "address:port to listen on")
+	debug := flag.Bool("debug", false, "enable debug output")
 	flag.Parse()
 
-	// Spin off a goroutine to watch for a SIGINT and die if we get one
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
-	sc := &serial.Config{Name: *port, Baud: *baud}
-
-	s, err := serial.OpenPort(sc)
+	port, err := serial.Open(*portName, &serial.Mode{BaudRate: *baud})
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("failed to open serial port", "port", *portName, "error", err)
+		os.Exit(1)
 	}
-	defer s.Close()
+	defer port.Close()
 
-	go newSerialListener(s)
+	if err := serve(ctx, *listenAddr, port, *debug); err != nil {
+		slog.Error("server error", "error", err)
+		os.Exit(1)
+	}
+}
 
-	<-sig
-	log.Println("SIGINT received.  Shutting down...")
-	os.Exit(1)
+func serve(ctx context.Context, addr string, port serial.Port, debug bool) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	defer ln.Close()
+
+	slog.Info("listening for connections", "addr", addr)
+
+	bc := newBroadcaster()
+	writeCh := make(chan []byte, 15)
+
+	go readSerial(port, bc)
+	go writeSerial(port, writeCh)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				slog.Info("shutting down")
+				return nil
+			}
+			return fmt.Errorf("accept: %w", err)
+		}
+
+		slog.Info("client connected", "remote", conn.RemoteAddr())
+
+		consumer := bc.subscribe()
+		go forwardToClient(conn, consumer, bc)
+		go forwardFromClient(conn, writeCh, debug)
+	}
+}
+
+// readSerial reads KISS frames from the serial port and broadcasts them to all clients.
+func readSerial(port serial.Port, bc *broadcaster) {
+	r := bufio.NewReader(port)
+	for {
+		var frame []byte
+		for len(frame) <= minKISSFrameSize {
+			var err error
+			frame, err = r.ReadBytes(kissDelimiter)
+			if err != nil {
+				slog.Error("serial read error", "error", err)
+				return
+			}
+		}
+		out := make([]byte, len(frame))
+		copy(out, frame)
+		bc.send(out)
+	}
+}
+
+// forwardToClient sends broadcast frames to a single TCP client.
+func forwardToClient(conn net.Conn, consumer chan []byte, bc *broadcaster) {
+	defer conn.Close()
+	defer bc.unsubscribe(consumer)
+
+	for frame := range consumer {
+		if _, err := conn.Write(frame); err != nil {
+			slog.Info("client disconnected", "remote", conn.RemoteAddr(), "error", err)
+			return
+		}
+	}
+}
+
+// forwardFromClient reads KISS frames from a TCP client and queues them for serial output.
+func forwardFromClient(conn net.Conn, writeCh chan<- []byte, debug bool) {
+	r := bufio.NewReader(conn)
+	for {
+		firstByte, err := r.ReadByte()
+		if err != nil {
+			slog.Info("client disconnected", "remote", conn.RemoteAddr(), "error", err)
+			return
+		}
+
+		var buf bytes.Buffer
+		buf.WriteByte(firstByte)
+
+		var frame []byte
+		for len(frame) <= minKISSFrameSize {
+			frame, err = r.ReadBytes(kissDelimiter)
+			if err != nil {
+				slog.Info("client disconnected", "remote", conn.RemoteAddr(), "error", err)
+				return
+			}
+
+			if debug {
+				dumpFrame(frame)
+			}
+		}
+
+		buf.Write(frame)
+		writeCh <- buf.Bytes()
+	}
+}
+
+// writeSerial drains the write channel and sends frames to the serial port.
+func writeSerial(port serial.Port, writeCh <-chan []byte) {
+	for frame := range writeCh {
+		if _, err := port.Write(frame); err != nil {
+			slog.Error("serial write error", "error", err)
+		}
+	}
+}
+
+func dumpFrame(frame []byte) {
+	fmt.Println("Byte#\tHexVal\tChar\tChar>>1\tBinary")
+	fmt.Println("-----\t------\t----\t-------\t------")
+	for i, b := range frame {
+		fmt.Printf("%4d \t%#x \t%v \t%v\t%08b\n", i, b, string(b), string(b>>1), b)
+	}
 }

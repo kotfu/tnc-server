@@ -1,5 +1,6 @@
-// tnc-server bridges a KISS TNC serial device to multiple TCP clients,
+// tnc-server bridges a KISS TNC to multiple TCP clients,
 // allowing several applications to share a single packet radio TNC.
+// The TNC can be connected via serial port or TCP (e.g. Direwolf, soundmodem).
 package main
 
 import (
@@ -8,11 +9,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
+	"time"
 
 	"go.bug.st/serial"
 )
@@ -20,7 +24,24 @@ import (
 const (
 	minKISSFrameSize = 15   // smallest KISS packet we expect to see
 	kissDelimiter    = 0xc0 // KISS frame boundary marker
+	reconnectDelay   = 5 * time.Second
 )
+
+// connector returns a new connection to the TNC device.
+type connector func(ctx context.Context) (io.ReadWriteCloser, error)
+
+func serialConnector(portName string, baud int) connector {
+	return func(_ context.Context) (io.ReadWriteCloser, error) {
+		return serial.Open(portName, &serial.Mode{BaudRate: baud})
+	}
+}
+
+func tcpConnector(addr string) connector {
+	return func(ctx context.Context) (io.ReadWriteCloser, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
+}
 
 // broadcaster distributes frames from one producer to many consumers.
 type broadcaster struct {
@@ -62,8 +83,8 @@ func (b *broadcaster) send(data []byte) {
 }
 
 func main() {
-	portName := flag.String("port", "/dev/ttyUSB0", "serial port device")
-	baud := flag.Int("baud", 4800, "baud rate for serial device")
+	portName := flag.String("port", "/dev/ttyUSB0", "serial port or tcp:host:port for network KISS")
+	baud := flag.Int("baud", 4800, "baud rate for serial device (ignored for tcp)")
 	listenAddr := flag.String("listen", ":6700", "address:port to listen on")
 	debug := flag.Bool("debug", false, "enable debug output")
 	flag.Parse()
@@ -71,20 +92,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	port, err := serial.Open(*portName, &serial.Mode{BaudRate: *baud})
-	if err != nil {
-		slog.Error("failed to open serial port", "port", *portName, "error", err)
-		os.Exit(1)
+	var (
+		connect   connector
+		reconnect bool
+	)
+	if addr, ok := strings.CutPrefix(*portName, "tcp:"); ok {
+		connect = tcpConnector(addr)
+		reconnect = true
+		slog.Info("using TCP KISS target", "addr", addr)
+	} else {
+		connect = serialConnector(*portName, *baud)
+		slog.Info("using serial port", "port", *portName, "baud", *baud)
 	}
-	defer port.Close()
 
-	if err := serve(ctx, *listenAddr, port, *debug); err != nil {
+	if err := serve(ctx, *listenAddr, connect, reconnect, *debug); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}
 }
 
-func serve(ctx context.Context, addr string, port serial.Port, debug bool) error {
+func serve(ctx context.Context, addr string, connect connector, reconnect, debug bool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
@@ -93,21 +120,26 @@ func serve(ctx context.Context, addr string, port serial.Port, debug bool) error
 
 	slog.Info("listening for connections", "addr", addr)
 
+	tncCtx, tncCancel := context.WithCancel(ctx)
+	defer tncCancel()
+
 	bc := newBroadcaster()
 	writeCh := make(chan []byte, 15)
 
-	go readSerial(port, bc)
-	go writeSerial(port, writeCh)
+	go func() {
+		manageTNC(tncCtx, connect, reconnect, bc, writeCh)
+		tncCancel()
+	}()
 
 	go func() {
-		<-ctx.Done()
+		<-tncCtx.Done()
 		ln.Close()
 	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if tncCtx.Err() != nil {
 				slog.Info("shutting down")
 				return nil
 			}
@@ -122,16 +154,68 @@ func serve(ctx context.Context, addr string, port serial.Port, debug bool) error
 	}
 }
 
-// readSerial reads KISS frames from the serial port and broadcasts them to all clients.
-func readSerial(port serial.Port, bc *broadcaster) {
-	r := bufio.NewReader(port)
+// manageTNC maintains the connection to the TNC device. For TCP targets,
+// it automatically reconnects on failure. For serial, it exits on error.
+func manageTNC(ctx context.Context, connect connector, reconnect bool, bc *broadcaster, writeCh <-chan []byte) {
+	for {
+		tnc, err := connect(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !reconnect {
+				slog.Error("TNC connection failed", "error", err)
+				return
+			}
+			slog.Error("TNC connection failed, retrying", "error", err, "delay", reconnectDelay)
+			select {
+			case <-time.After(reconnectDelay):
+				continue
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		slog.Info("TNC connected")
+
+		readDone := make(chan struct{})
+		writeDone := make(chan struct{})
+		go func() {
+			readTNC(tnc, bc)
+			close(readDone)
+		}()
+		go func() {
+			writeTNC(tnc, writeCh, readDone)
+			close(writeDone)
+		}()
+
+		<-readDone
+		tnc.Close()
+		<-writeDone
+
+		if !reconnect {
+			slog.Error("TNC connection lost")
+			return
+		}
+		slog.Warn("TNC connection lost, reconnecting", "delay", reconnectDelay)
+		select {
+		case <-time.After(reconnectDelay):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// readTNC reads KISS frames from the TNC and broadcasts them to all clients.
+func readTNC(tnc io.Reader, bc *broadcaster) {
+	r := bufio.NewReader(tnc)
 	for {
 		var frame []byte
 		for len(frame) <= minKISSFrameSize {
 			var err error
 			frame, err = r.ReadBytes(kissDelimiter)
 			if err != nil {
-				slog.Error("serial read error", "error", err)
+				slog.Error("TNC read error", "error", err)
 				return
 			}
 		}
@@ -154,7 +238,7 @@ func forwardToClient(conn net.Conn, consumer chan []byte, bc *broadcaster) {
 	}
 }
 
-// forwardFromClient reads KISS frames from a TCP client and queues them for serial output.
+// forwardFromClient reads KISS frames from a TCP client and queues them for TNC output.
 func forwardFromClient(conn net.Conn, writeCh chan<- []byte, debug bool) {
 	r := bufio.NewReader(conn)
 	for {
@@ -185,11 +269,18 @@ func forwardFromClient(conn net.Conn, writeCh chan<- []byte, debug bool) {
 	}
 }
 
-// writeSerial drains the write channel and sends frames to the serial port.
-func writeSerial(port serial.Port, writeCh <-chan []byte) {
-	for frame := range writeCh {
-		if _, err := port.Write(frame); err != nil {
-			slog.Error("serial write error", "error", err)
+// writeTNC drains the write channel and sends frames to the TNC.
+// It stops when the stop channel is closed (indicating the read side died).
+func writeTNC(tnc io.Writer, writeCh <-chan []byte, stop <-chan struct{}) {
+	for {
+		select {
+		case frame := <-writeCh:
+			if _, err := tnc.Write(frame); err != nil {
+				slog.Error("TNC write error", "error", err)
+				return
+			}
+		case <-stop:
+			return
 		}
 	}
 }

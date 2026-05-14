@@ -158,7 +158,8 @@ Once you have this package installed, you'll run com2tcp like this:
 You'll want to substitute the IP address of your **tnc-server**.  CNCB0 refers to COM2 in com0com parlance.   For more info on what to put here, check out the [README file for com0com](http://com0com.cvs.sourceforge.net/viewvc/com0com/com0com/ReadMe.txt?revision=RELEASED) and the [README file for com2tcp](http://com0com.cvs.sourceforge.net/*checkout*/com0com/com2tcp/ReadMe.txt?revision=RELEASED).
 
 ## TNCs known to work with tnc-server
-[Argent Data Tracker2](http://www.argentdata.com/products/tracker2.html)
+- [Argent Data Tracker2](http://www.argentdata.com/products/tracker2.html)
+- Kenwood TH-D75 handheld radio
 
 If you've tested **tnc-server** with another TNC, let me know and I will add it to this list.
 

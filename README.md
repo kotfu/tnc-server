@@ -28,6 +28,60 @@ Usage:
 -debug - enable debug output with hex dumps of received frames
 ```
 
+On Linux you can have `systemd` automatically start `tnc-server` when the machines boots. Put this
+in `/etc/systemd/system/tnc-server.service`:
+```
+# /etc/systemd/system/tnc-server.service
+[Unit]
+Description=TNC Server - Multiplexing network server for KISS TNCs
+Documentation=https://github.com/chrissnell/tnc-server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/tnc-server
+ExecStart=/usr/local/bin/tnc-server -port=${TNC_DEVICE} -baud=${TNC_BAUD} -listen=${TNC_LISTEN}
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# Allow access to serial devices
+SupplementaryGroups=dialout
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then put this configuration file in `/etc/default/tnc-server`:
+```
+# /etc/default/tnc-server
+# Configuration for the tnc-server systemd service
+
+# Serial device path, or tcp:host:port for network KISS (e.g. Direwolf)
+# Examples:
+#   /dev/ttyACM0              (serial)
+#   tcp:192.168.1.100:8001    (TCP KISS, e.g. Direwolf)
+TNC_DEVICE=/dev/ttyACM0
+
+# Baud rate for serial device (ignored for TCP connections)
+TNC_BAUD=1200
+
+# IP address and port to listen for incoming client connections
+TNC_LISTEN=0.0.0.0:6700
+```
+
+Adjust the settings in the config file as necessary. Then:
+```
+$ sudo systemctl daemon-reload
+$ sudo systemctl enable --now tnc-server
+```
+
 ### Windows
 Download the appropriate **tnc-server** package for your architecture from the [releases page](https://github.com/chrissnell/tnc-server/releases).   See below for virtual COM port emulation, if you plan on running a Windows-based APRS client.
 ```
